@@ -1,61 +1,80 @@
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 import re
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from databricks.sdk import WorkspaceClient
+w = WorkspaceClient()
+openai_client = w.serving_endpoints.get_open_ai_client()
 
-def perform_semantic_chunking(document, url, doc_id, chunk_size=1024, chunk_overlap=128):
+def summarize_document(doc_text):
     """
-    Performs semantic chunking on a document using recursive character splitting
-    and adds metadata for section info and density.
+    Generates a compact semantic summary of the document for high-level embedding
+    using the Databricks-hosted LLM. The summary is later used for document-level retrieval.
     """
-    # Create the text splitter
-    text_splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", ". ", " ", ""],
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
+    if not doc_text.strip():
+        return "Empty document."
+
+    prompt = f"""
+Summarize the main topics purpose of the following documentation page in 1-2 sentences to be used in retrieval in a rag pipeline."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="databricks-gpt-oss-20b",
+            messages=[
+                {"role": "system", "content": "You are a Databricks documentation assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=500,
+            temperature=0.1,
+        )
+        return response.choices[0].message.content[1]["text"]
+    except Exception as e:
+        print(f"⚠️ Summarization failed for {e}")
+        return "Summary unavailable due to error."
+
+# -------------------------------------------------------------------------
+# 🔹 Function: Section-aware Chunking
+# -------------------------------------------------------------------------
+def perform_section_chunking(document, url, doc_id, chunk_size=1200, chunk_overlap=200):
+    """
+    Performs section-aware chunking for structured docs like Databricks documentation.
+    No language model used — purely regex + text splitter.
+    """
+    text = re.sub(r"â€™", "'", document)
+    text = re.sub(r"Â", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    section_pattern = re.compile(
+        r"(?<=\n)([A-Z][A-Za-z0-9\s\-]+(?:for the workspace|management|tokens?|users?|principals?)?)\n\1\n"
     )
 
-    # Clean the document text
-    text = document.encode("utf-8", "ignore").decode("utf-8")
-    text = re.sub(r"â€™", "'", text)
-    text = re.sub(r"Â", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    sections = []
+    last_end = 0
+    for match in section_pattern.finditer(text):
+        header = match.group(1).strip()
+        start = match.start()
+        if last_end < start:
+            sections.append((header, text[last_end:start].strip()))
+        last_end = match.end()
 
-    # Split into chunks
-    semantic_chunks = text_splitter.split_text(text)
+    if last_end < len(text):
+        sections.append(("Miscellaneous", text[last_end:].strip()))
 
-    section_patterns = [
-        r'^#+\s+(.+)$',      # Markdown headers
-        r'^.+\n[=\-]{2,}$',  # Underlined headers
-        r'^[A-Z\s]+:$',      # ALL CAPS section titles
-        r'^(Step\s+\d+:)'    # Step headers
-    ]
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", ". ", " ", ""],
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
 
     documents = []
-    current_section = url.split("/")[-1].replace("-", " ").title()
-
-    for i, chunk in enumerate(semantic_chunks):
-        chunk_lines = chunk.split('\n')
-        for line in chunk_lines:
-            for pattern in section_patterns:
-                match = re.match(pattern, line.strip())
-                if match:
-                    current_section = match.group(0)
-                    break
-
-        # Calculate semantic density
-        words = re.findall(r'\b\w+\b', chunk.lower())
-        stopwords = {'the','and','is','of','to','a','in','that','it','with','as','for'}
-        content_words = [w for w in words if w not in stopwords]
-        semantic_density = len(content_words) / max(1, len(words))
-
-        documents.append({
-            "doc_id": doc_id,
-            "url": url,
-            "chunk_id": i,
-            "chunk_text": chunk,
-            "chunk_size": len(chunk),
-            "section": current_section,
-            "semantic_density": round(semantic_density, 3)
-        })
-
+    for section_title, section_text in sections:
+        chunks = splitter.split_text(section_text)
+        for i, chunk in enumerate(chunks):
+            documents.append({
+                "doc_id": doc_id,
+                "url": url,
+                "section": section_title,
+                "chunk_id": i,
+                "chunk_text": chunk,
+                "chunk_size": len(chunk)
+            })
     return documents
