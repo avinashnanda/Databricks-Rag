@@ -66,15 +66,18 @@ def perform_section_chunking(document, url, doc_id, chunk_size=1200, chunk_overl
     )
 
     documents = []
+    global_counter = 0  # <── add this
+
     for section_title, section_text in sections:
         chunks = splitter.split_text(section_text)
-        for i, chunk in enumerate(chunks):
+        for chunk in chunks:
             documents.append({
                 "doc_id": doc_id,
                 "url": url,
                 "section": section_title,
-                "chunk_id": i,
+                "chunk_id": f"{doc_id}_{global_counter}",  # use global counter
                 "chunk_text": chunk,
                 "chunk_size": len(chunk)
             })
+            global_counter += 1  # increment globally
     return documents
